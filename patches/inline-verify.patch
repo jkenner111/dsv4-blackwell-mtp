@@ -1,0 +1,126 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 001b0cefe..76b367809 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -338,6 +338,9 @@ struct server_slot {
+ 
+     void update_batch(llama_batch & batch) {
+         const int n_draft_max = get_n_draft_max();
++        // Inline verify: draft tokens are verified one at a time via
++        // single-token llama_decode, not batched. This avoids the 2.5x
++        // overhead of MoE batched verification on DeepSeek V4.
+         if (n_draft_max > 0) {
+             GGML_ASSERT(can_speculate());
+ 
+@@ -2962,71 +2965,64 @@ private:
+                 }
+             }
+ 
+-            // speculative decoding - main model sample and accept
++            // speculative decoding - main model inline single-token verify
++            // On DeepSeek V4 MoE, batched verification is 2.5x slower per token
++            // than sequential single-token decode. We verify each draft token
++            // via a separate llama_decode call (127ms) instead of one batched
++            // call (340ms for 2 tokens).
+             for (auto & slot : slots) {
+                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+                     continue;
+                 }
+ 
+-                // save the original draft size
+                 const size_t n_draft = slot.spec_draft.size();
+-
+                 GGML_ASSERT(n_draft > 0);
+ 
+-                // verify and try to accept the draft
+-                {
+-                    const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+-
+-                    // only save the sampler sampler state if we use checkpoints
+-                    common_sampler_ptr smpl_save;
+-                    if (use_ckpt) {
+-                        smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+-                    }
+-
+-                    GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+-                    slot.spec_i_batch.clear();
++                // Verify each draft token one at a time via single-token decode
++                std::vector<llama_token> accepted;
++                accepted.reserve(n_draft + 1);
++                accepted.push_back(slot.sampled); // baseline token already committed
+ 
+-                    SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
++                for (size_t i = 0; i < n_draft; i++) {
++                    llama_token draft_token = slot.spec_draft[i];
+ 
+-                    GGML_ASSERT(accepted.size() >= 1);
++                    // Run single-token decode to get target's prediction
++                    llama_batch verify_batch = llama_batch_init(1, 0, 1);
++                    verify_batch.token[0]  = draft_token;
++                    verify_batch.pos[0]    = slot.prompt.tokens.pos_next();
++                    verify_batch.n_seq_id[0] = 1;
++                    verify_batch.seq_id[0] = slot.id;
++                    verify_batch.logits[0] = true;
+ 
+-                    // check for partial draft acceptance
+-                    if (accepted.size() < slot.spec_draft.size() + 1) {
+-                        if (use_ckpt) {
+-                            // partial acceptance is not supported by the context -> truncate the draft and restore the state
+-                            slot.spec_draft = std::move(accepted);
++                    int ret = llama_decode(slot.ctx, verify_batch);
++                    llama_batch_free(verify_batch);
+ 
+-                            const auto & ckpt = slot.spec_ckpt;
+-
+-                            SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n",
+-                                    ckpt.pos_min, ckpt.pos_max, ckpt.size());
+-
+-                            const size_t n = llama_state_seq_set_data_ext(slot.ctx, ckpt.data.data(), ckpt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-                            if (n != ckpt.size()) {
+-                                GGML_ABORT("%s: failed to restore context checkpoint (pos_min=%d, pos_max=%d, size=%zu, get_data_ext->%zu, set_data_ext->%zu",
+-                                        __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt.size(), n);
+-                            }
+-
+-                            if (slot.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+-                                if (!llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1)) {
+-                                    SRV_WRN("%s", "the target context does not support partial sequence removal\n");
+-                                }
+-                            }
++                    if (ret != 0 && ret != 1) {
++                        SLT_WRN(slot, "inline verify llama_decode failed, ret=%d\n", ret);
++                        break;
++                    }
+ 
+-                            slot.prompt.tokens.keep_first(ckpt.n_tokens);
+-                            slot.smpl = std::move(smpl_save);
++                    // Get target's top token
++                    auto * smpl = slot.smpl.get();
++                    common_sampler_sample(smpl, slot.ctx, -1, true);
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
++                    llama_token target_token = cur_p->data[0].id;
++                    common_sampler_accept(smpl, target_token, true);
+ 
+-                            continue;
+-                        }
++                    slot.prompt.tokens.push_back(draft_token);
+ 
+-                        LOG_DBG("%s: partial acceptance: %zu < %zu\n", __func__, accepted.size(), slot.spec_draft.size());
++                    if (target_token == draft_token) {
++                        accepted.push_back(draft_token);
++                    } else {
++                        // Target disagrees — stop the draft here
++                        break;
+                     }
++                }
+ 
+-                    common_speculative_accept(slot.spec.get(), accepted.size() - 1);
++                slot.spec_i_batch.clear();
++                slot.spec_draft = std::move(accepted);
+ 
+-                    slot.spec_draft = std::move(accepted);
+-                }
++                SLT_DBG(slot, "inline verify: n_draft=%zu, accepted=%zu\n", n_draft, slot.spec_draft.size());
+ 
+                 const int64_t t_current = ggml_time_us();
+ 
