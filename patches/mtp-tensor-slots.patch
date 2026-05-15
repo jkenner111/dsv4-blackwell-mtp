@@ -78,7 +78,7 @@ index cfc2a97d6..8c270d0eb 100644
                  } break;
              case LLM_ARCH_LLAMA:
 diff --git a/src/llama-model.h b/src/llama-model.h
-index d60b0986e..1eda3db2b 100644
+index d60b0986e..fe55b76f5 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -506,6 +506,16 @@ struct llama_layer {
@@ -98,6 +98,17 @@ index d60b0986e..1eda3db2b 100644
      // gemma4 layer output scale
      struct ggml_tensor * out_scale = nullptr;
  
+@@ -558,6 +568,10 @@ struct llama_model {
+     struct ggml_tensor * output_hc_scale = nullptr;
+     struct ggml_tensor * output_norm_enc = nullptr;
+ 
++    // MTP draft hidden state buffer (CPU, persists across graphs)
++    ggml_backend_buffer_t mtp_hidden_buf = nullptr;
++    struct ggml_tensor  * mtp_prev_hc     = nullptr;
++
+     // classifier
+     struct ggml_tensor * cls       = nullptr;
+     struct ggml_tensor * cls_b     = nullptr;
 diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
 index 56af9707e..650a5d651 100644
 --- a/src/models/deepseek4.cpp
