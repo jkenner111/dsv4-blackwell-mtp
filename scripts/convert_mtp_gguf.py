@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
-"""Convert ds4 MTP GGUF to standard deepseek4 GGUF for Fringe210 -md flag."""
+"""Convert ds4 MTP GGUF to standard deepseek4 GGUF for Fringe210 -md flag.
+
+Reads the MTP GGUF (mtp.0.* tensor names), writes a new GGUF with blk.0.* names
+and general.architecture = deepseek4.
+
+Usage:
+  python3 convert_mtp_gguf.py <input.mtp.gguf> [output.gguf]
+
+Requires the gguf-py package from the Fringe210 llama.cpp tree.
+Auto-detects ~/llama-dsv4-fringe/gguf-py or /tmp/fringe-analysis/gguf-py.
+"""
 import sys, os, numpy as np
 from collections import OrderedDict
 from typing import Any
 
-fringe_py = "/tmp/fringe-analysis/gguf-py"
-if fringe_py not in sys.path:
-    sys.path.insert(0, fringe_py)
+# Auto-detect gguf-py from common Fringe210 locations
+for candidate in [
+    os.path.expanduser("~/llama-dsv4-fringe/gguf-py"),
+    "/tmp/fringe-analysis/gguf-py",
+]:
+    if candidate not in sys.path and os.path.isdir(candidate):
+        sys.path.insert(0, candidate)
+        break
 
-from gguf import GGUFReader, GGUFValueType
-from gguf.gguf_writer import GGUFWriter
+try:
+    from gguf import GGUFReader, GGUFValueType
+    from gguf.gguf_writer import GGUFWriter
+except ImportError:
+    print("Error: gguf-py not found. Set PYTHONPATH to Fringe210/gguf-py")
+    sys.exit(1)
 
 
 def extract_value(field) -> Any:
@@ -119,6 +138,7 @@ def convert(input_path: str, output_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
+        print(__doc__)
         print("Usage: python3 convert_mtp_gguf.py <input.mtp.gguf> [output.gguf]")
         sys.exit(1)
     inp = sys.argv[1]
