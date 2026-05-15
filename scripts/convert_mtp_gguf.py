@@ -30,7 +30,7 @@ except ImportError:
     print("Error: gguf-py not found. Set PYTHONPATH to Fringe210/gguf-py")
     sys.exit(1)
 
-DONOR_TENSORS = ["token_embd.weight", "output_norm.weight", "output.weight"]
+DONOR_TENSORS = ["token_embd.weight", "output_norm.weight", "output.weight", "output_hc_base.weight", "output_hc_fn.weight", "output_hc_scale.weight"]
 
 
 def read_metadata(reader, label):
