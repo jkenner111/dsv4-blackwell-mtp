@@ -108,7 +108,7 @@ def convert(input_path: str, donor_path: str, output_path: str):
     for name in DONOR_TENSORS:
         if name in donor_tensors:
             t = donor_tensors[name]
-            print(f"  Donor tensor: {name}  {list(t.shape)}  {t.nbytes} bytes")
+            print(f"  Donor tensor: {name}  {list(t.shape)}  {t.n_bytes} bytes")
         else:
             print(f"  WARNING: {name} not in donor")
 
