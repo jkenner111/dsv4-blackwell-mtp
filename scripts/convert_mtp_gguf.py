@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """Convert ds4 MTP GGUF to standalone deepseek4 draft GGUF for Fringe210 -md flag.
 
-Reads MTP GGUF, seeds metadata+tensors from donor main model, overlays MTP keys,
-renames tensors mtp.0.* -> blk.0.*, forces block_count=1 and hash_layer_count=0.
-
-Usage:
-  python3 convert_mtp_gguf.py <mtp.gguf> --donor <main.gguf> [output.gguf]
-
-Patches: P1-P8 (see git log)
+Patches: P1-P9. Borrows indexer/compressor tensors from donor's last block.
 """
-import sys, os, numpy as np
+import sys, os, re, numpy as np
 from collections import OrderedDict
-from typing import Any, Sequence
+from typing import Any
 
 for candidate in [
     os.path.expanduser("~/llama-dsv4-fringe/gguf-py"),
@@ -25,10 +19,10 @@ try:
     from gguf import GGUFReader, GGUFValueType
     from gguf.gguf_writer import GGUFWriter
 except ImportError:
-    print("Error: gguf-py not found")
-    sys.exit(1)
+    print("Error: gguf-py not found"); sys.exit(1)
 
-DONOR_TENSORS = [
+# Global tensors always copied from donor
+DONOR_GLOBALS = [
     "token_embd.weight",
     "output_norm.weight",
     "output.weight",
@@ -46,7 +40,7 @@ def read_metadata(reader, label):
         try:
             md[key] = (field.contents(), field.types)
         except Exception as e:
-            print(f"  WARNING [{label}]: key {key}: {e}")
+            print(f"  WARNING [{label}]: {key}: {e}")
     return md
 
 
@@ -75,7 +69,6 @@ def write_metadata(writer, metadata):
 
 
 def slice_arrays(metadata, donor_bc):
-    """P6: Slice per-layer arrays to length 1 to match block_count=1."""
     for key, (val, types) in list(metadata.items()):
         if types[0] != GGUFValueType.ARRAY:
             continue
@@ -87,16 +80,25 @@ def slice_arrays(metadata, donor_bc):
             if hasattr(last, 'item'):
                 last = last.item()
             metadata[key] = ([last], types)
-            print(f"  sliced {key}: {n} -> 1 (kept last: {last})")
+            print(f"  sliced {key}: {n} -> 1 ({last})")
 
 
 def force_override(merged, suffix, new_val):
-    """Set a metadata key ending with suffix to new_val."""
     for key in merged:
         if key.endswith(suffix):
             merged[key] = (new_val, merged[key][1])
             print(f"Forced {key} = {new_val}")
             return
+
+
+def find_last_block(tensors):
+    """Find the highest blk.N.* layer number in donor tensors."""
+    max_n = -1
+    for name in tensors:
+        m = re.match(r'blk\.(\d+)\.', name)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return max_n
 
 
 def convert(input_path: str, donor_path: str, output_path: str):
@@ -116,45 +118,61 @@ def convert(input_path: str, donor_path: str, output_path: str):
     donor_bc = None
     for key in donor_meta:
         if key.endswith(".block_count"):
-            donor_bc = int(donor_meta[key][0])
-            break
+            donor_bc = int(donor_meta[key][0]); break
     print(f"  Donor block_count: {donor_bc}")
 
     donor_tensors = {t.name: t for t in donor.tensors}
-    for name in DONOR_TENSORS:
-        if name in donor_tensors:
-            t = donor_tensors[name]
-            print(f"  Donor tensor: {name}  {list(t.shape)}  {t.n_bytes} bytes")
-        else:
-            print(f"  WARNING: {name} not in donor")
+    last_block = find_last_block(donor_tensors)
+    print(f"  Donor last block: blk.{last_block}")
 
     # P5: seed from donor, overlay MTP
     merged = OrderedDict(donor_meta)
     merged.update(mtp_meta)
-
-    # P6: slice per-layer arrays
     if donor_bc is not None:
         slice_arrays(merged, donor_bc)
+    force_override(merged, ".block_count", 1)
+    force_override(merged, ".hash_layer_count", 0)
 
-    # Force block_count=1, hash_layer_count=0
-    force_override(merged, ".block_count", 1)       # P5
-    force_override(merged, ".hash_layer_count", 0)  # P8
+    # P9: find which blk.{last_block}.* tensors the MTP source is missing
+    mtp_tensor_names = {rt.name for rt in reader.tensors}
+    borrow = {}
+    blk_re = re.compile(r'^blk\.\d+\.(.+)$')
+    for name, t in donor_tensors.items():
+        m = blk_re.match(name)
+        if not m:
+            continue
+        suffix = m.group(1)
+        blk_n = int(name.split('.')[1])
+        if blk_n != last_block:
+            continue
+        mtp_name = f"mtp.0.{suffix}"
+        target_name = f"blk.0.{suffix}"
+        if mtp_name not in mtp_tensor_names and target_name not in mtp_tensor_names:
+            borrow[name] = (target_name, t)
+            print(f"  [P9 borrow] {name} -> {target_name}  {list(t.shape)}  {t.n_bytes} bytes")
 
     arch = "deepseek4"
     print(f"Target arch: {arch}")
     print(f"Merged keys: {len(merged)}")
-    print(f"MTP tensors: {len(reader.tensors)}")
+    print(f"MTP tensors: {len(reader.tensors)}, borrowed: {len(borrow)}")
 
     writer = GGUFWriter(output_path, arch)
     write_metadata(writer, merged)
 
     print(f"\nAdding tensors...")
-    for name in DONOR_TENSORS:
+    # Global donor tensors
+    for name in DONOR_GLOBALS:
         if name in donor_tensors:
             t = donor_tensors[name]
             writer.add_tensor(name, t.data, raw_dtype=t.tensor_type)
             print(f"  [+donor] {name}")
 
+    # Borrowed per-block tensors from donor's last block
+    for orig_name, (target_name, t) in borrow.items():
+        writer.add_tensor(target_name, t.data, raw_dtype=t.tensor_type)
+        print(f"  [borrow] {target_name}")
+
+    # Remapped MTP tensors
     for i, rt in enumerate(reader.tensors):
         new_name = rt.name
         if rt.name.startswith("mtp.0."):
@@ -172,25 +190,19 @@ def convert(input_path: str, donor_path: str, output_path: str):
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__); sys.exit(1)
-
     inp = sys.argv[1]
-    donor = None
-    out = "mtp-converted-deepseek4.gguf"
-    args = sys.argv[2:]
-    i = 0
+    donor = None; out = "mtp-converted-deepseek4.gguf"
+    args = sys.argv[2:]; i = 0
     while i < len(args):
         if args[i] == "--donor" and i + 1 < len(args):
             donor = args[i + 1]; i += 2
         elif not args[i].startswith("--"):
             out = args[i]; i += 1
-        else:
-            i += 1
-
+        else: i += 1
     if not os.path.exists(inp):
-        print(f"Error: MTP not found: {inp}"); sys.exit(1)
+        print(f"Error: {inp} not found"); sys.exit(1)
     if not donor:
         print("Error: --donor required"); sys.exit(1)
     if not os.path.exists(donor):
-        print(f"Error: donor not found: {donor}"); sys.exit(1)
-
+        print(f"Error: {donor} not found"); sys.exit(1)
     convert(inp, donor, out)
