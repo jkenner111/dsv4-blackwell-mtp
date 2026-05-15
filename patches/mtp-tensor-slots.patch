@@ -99,10 +99,38 @@ index d60b0986e..1eda3db2b 100644
      struct ggml_tensor * out_scale = nullptr;
  
 diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
-index 56af9707e..3971fcbc0 100644
+index 56af9707e..650a5d651 100644
 --- a/src/models/deepseek4.cpp
 +++ b/src/models/deepseek4.cpp
-@@ -1375,14 +1375,38 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
+@@ -943,9 +943,24 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
+         return inp_dsv4;
+     };
+ 
+-    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
+-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
+-    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
++    // MTP fusion input pathway: embed -> enorm -> e_proj -> repeat to HC
++    // h_proj pathway deferred (requires prev hidden state from session)
++    if (hparams.nextn_predict_layers > 0 &&
++        il >= n_layer - hparams.nextn_predict_layers &&
++        layer.mtp_e_proj)
++    {
++        ggml_tensor * e_normed = ggml_rms_norm(ctx0, inpL, norm_rms_eps);
++        ggml_tensor * e_out = ggml_mul_mat(ctx0, layer.mtp_e_proj, e_normed);
++        inpL = ggml_reshape_3d(ctx0, e_out, n_embd, 1, n_tokens);
++        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
++        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
++    }
++    else
++    {
++        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
++        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
++        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
++    }
+ 
+     const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
+ 
+@@ -1375,14 +1390,38 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
          inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
      }
  
