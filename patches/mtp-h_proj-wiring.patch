@@ -1,53 +1,56 @@
-diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
 --- a/src/models/deepseek4.cpp
 +++ b/src/models/deepseek4.cpp
-@@ -941,10 +941,42 @@
-         return inp_dsv4;
+@@ -944,18 +944,50 @@
      };
  
--    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
--    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
--    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
-+    // MTP fusion input pathway
-+    bool is_mtp = hparams.nextn_predict_layers > 0 && n_layer == 1 &&
-+                  model.layers[0].mtp_e_proj;
+     // MTP fusion input pathway: embed -> enorm -> e_proj -> repeat to HC
+-    // h_proj pathway deferred (requires prev hidden state from session)
+-    if (hparams.nextn_predict_layers > 0 &&
+-        model.layers[n_layer - 1].mtp_e_proj)
+-    {
+-        ggml_tensor * e_normed = ggml_rms_norm(ctx0, inpL, norm_rms_eps);
+-        ggml_tensor * e_out = ggml_mul_mat(ctx0, model.layers[n_layer - 1].mtp_e_proj, e_normed);
+-        inpL = ggml_reshape_3d(ctx0, e_out, n_embd, 1, n_tokens);
+-        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
+-        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
+-    }
+-    else
+-    {
++    bool is_mtp = hparams.nextn_predict_layers > 0 &&
++                  model.layers[n_layer - 1].mtp_e_proj;
 +
 +    if (is_mtp) {
-+        const auto & mtp_layer = model.layers[0];
++        const auto & mtp_layer = model.layers[n_layer - 1];
 +
-+        // e_proj pathway: embed -> enorm -> e_proj -> repeat to HC
-+        ggml_tensor * e_n = ggml_rms_norm(ctx0, inpL, norm_rms_eps);
-+        ggml_tensor * e_o = ggml_mul_mat(ctx0, mtp_layer.mtp_e_proj, e_n);
-+        ggml_tensor * e_h = ggml_repeat_4d(ctx0,
-+            ggml_reshape_3d(ctx0, e_o, n_embd, 1, n_tokens),
++        // e_proj pathway
++        ggml_tensor * e_normed = ggml_rms_norm(ctx0, inpL, norm_rms_eps);
++        ggml_tensor * e_out = ggml_mul_mat(ctx0, mtp_layer.mtp_e_proj, e_normed);
++        ggml_tensor * e_hc = ggml_repeat_4d(ctx0,
++            ggml_reshape_3d(ctx0, e_out, n_embd, 1, n_tokens),
 +            n_embd, n_hc, n_tokens, 1);
-+        e_h = ggml_reshape_3d(ctx0, e_h, n_embd, n_hc, n_tokens);
++        e_hc = ggml_reshape_3d(ctx0, e_hc, n_embd, n_hc, n_tokens);
 +
-+        // h_proj pathway: prev hidden state -> hnorm -> h_proj
++        // h_proj pathway (prev hidden state from previous decode)
 +        if (mtp_layer.mtp_h_proj && model.mtp_prev_hc) {
-+            ggml_tensor * pv = ggml_view_3d(ctx0, model.mtp_prev_hc,
++            ggml_tensor * prev_hc = ggml_view_3d(ctx0, model.mtp_prev_hc,
 +                n_embd, n_hc, 1,
 +                model.mtp_prev_hc->nb[0],
 +                model.mtp_prev_hc->nb[1], 0);
-+            ggml_tensor * hn = ggml_rms_norm(ctx0, pv, norm_rms_eps);
-+            ggml_tensor * ho = ggml_mul_mat(ctx0, mtp_layer.mtp_h_proj, hn);
-+            ggml_tensor * hh = ggml_repeat_4d(ctx0,
-+                ggml_reshape_3d(ctx0, ho, n_embd, 1, 1),
++            ggml_tensor * h_normed = ggml_rms_norm(ctx0, prev_hc, norm_rms_eps);
++            ggml_tensor * h_out = ggml_mul_mat(ctx0, mtp_layer.mtp_h_proj, h_normed);
++            ggml_tensor * h_hc = ggml_repeat_4d(ctx0,
++                ggml_reshape_3d(ctx0, h_out, n_embd, 1, 1),
 +                n_embd, n_hc, n_tokens, 1);
-+            hh = ggml_reshape_3d(ctx0, hh, n_embd, n_hc, n_tokens);
-+            inpL = ggml_add(ctx0, e_h, hh);
++            h_hc = ggml_reshape_3d(ctx0, h_hc, n_embd, n_hc, n_tokens);
++            inpL = ggml_add(ctx0, e_hc, h_hc);
 +        } else {
-+            inpL = e_h;
++            inpL = e_hc;
 +        }
 +    } else {
-+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
-+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
-+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
-+    }
- 
-     const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
- 
-@@ -1375,12 +1407,43 @@
+         inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
+         inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
+         inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
+@@ -1375,12 +1407,44 @@
          }
      }
  
@@ -58,7 +61,7 @@ diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
 -    cb(cur, "result_hc", -1);
 -
 -    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-+    // Output head — use MTP layer weights when available
++    // Output head (MTP-aware)
 +    ggml_tensor * cur;
 +    if (hparams.nextn_predict_layers > 0) {
 +        const auto & last_layer = model.layers[n_layer - 1];
