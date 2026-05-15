@@ -1,0 +1,151 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 274485700..f84028f16 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -576,6 +576,14 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_HC_FFN_BASE,                            "blk.%d.hc_ffn_base" },
+     { LLM_TENSOR_HC_FFN_FN,                              "blk.%d.hc_ffn_fn" },
+     { LLM_TENSOR_HC_FFN_SCALE,                           "blk.%d.hc_ffn_scale" },
++    { LLM_TENSOR_MTP_E_PROJ,          "blk.%d.e_proj"           },
++    { LLM_TENSOR_MTP_H_PROJ,          "blk.%d.h_proj"           },
++    { LLM_TENSOR_MTP_ENORM,           "blk.%d.enorm"            },
++    { LLM_TENSOR_MTP_HNORM,           "blk.%d.hnorm"            },
++    { LLM_TENSOR_MTP_HC_HEAD_BASE,    "blk.%d.hc_head_base"     },
++    { LLM_TENSOR_MTP_HC_HEAD_FN,      "blk.%d.hc_head_fn"       },
++    { LLM_TENSOR_MTP_HC_HEAD_SCALE,   "blk.%d.hc_head_scale"    },
++    { LLM_TENSOR_MTP_NORM,            "blk.%d.norm"              },
+     { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
+ };
+ 
+@@ -804,6 +812,14 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_HC_FFN_BASE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+     {LLM_TENSOR_HC_FFN_FN,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_HC_FFN_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SCALE}},
++    {LLM_TENSOR_MTP_E_PROJ,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_MTP_H_PROJ,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_MTP_ENORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_RMS_NORM}},
++    {LLM_TENSOR_MTP_HNORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_RMS_NORM}},
++    {LLM_TENSOR_MTP_HC_HEAD_BASE,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
++    {LLM_TENSOR_MTP_HC_HEAD_FN,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_MTP_HC_HEAD_SCALE,    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_SCALE}},
++    {LLM_TENSOR_MTP_NORM,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_RMS_NORM}},
+     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_ATTN_COMPRESSOR_APE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+     {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 72ce692a2..e53a85899 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -577,6 +577,15 @@ enum llm_tensor {
+     LLM_TENSOR_HC_FFN_BASE,
+     LLM_TENSOR_HC_FFN_FN,
+     LLM_TENSOR_HC_FFN_SCALE,
++    // MTP head tensors (DeepSeek V4)
++    LLM_TENSOR_MTP_E_PROJ,
++    LLM_TENSOR_MTP_H_PROJ,
++    LLM_TENSOR_MTP_ENORM,
++    LLM_TENSOR_MTP_HNORM,
++    LLM_TENSOR_MTP_HC_HEAD_BASE,
++    LLM_TENSOR_MTP_HC_HEAD_FN,
++    LLM_TENSOR_MTP_HC_HEAD_SCALE,
++    LLM_TENSOR_MTP_NORM,
+     LLM_TENSOR_FFN_GATE_TID2EID,
+     LLM_TENSOR_NEXTN_EH_PROJ,
+     LLM_TENSOR_NEXTN_EMBED_TOKENS,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index cfc2a97d6..4d656b757 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3285,6 +3285,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+                         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
+                         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
++
++                        // MTP head tensors for nextn_predict_layers
++                        if (hparams.nextn_predict_layers > 0 &&
++                            static_cast<uint32_t>(i) >= n_layer - hparams.nextn_predict_layers)
++                        {
++                            layer.mtp_e_proj         = create_tensor(tn(LLM_TENSOR_MTP_E_PROJ,        "weight", i), {n_embd, n_embd}, 0);
++                            layer.mtp_h_proj         = create_tensor(tn(LLM_TENSOR_MTP_H_PROJ,        "weight", i), {n_embd, n_embd}, 0);
++                            layer.mtp_enorm          = create_tensor(tn(LLM_TENSOR_MTP_ENORM,         "weight", i), {n_embd}, 0);
++                            layer.mtp_hnorm          = create_tensor(tn(LLM_TENSOR_MTP_HNORM,         "weight", i), {n_embd}, 0);
++                            layer.mtp_hc_head_base   = create_tensor(tn(LLM_TENSOR_MTP_HC_HEAD_BASE,  "weight", i), {n_hc}, 0);
++                            layer.mtp_hc_head_fn     = create_tensor(tn(LLM_TENSOR_MTP_HC_HEAD_FN,    "weight", i), {hc_dim, n_hc}, 0);
++                            layer.mtp_hc_head_scale  = create_tensor(tn(LLM_TENSOR_MTP_HC_HEAD_SCALE, "weight", i), {1}, 0);
++                            layer.mtp_norm           = create_tensor(tn(LLM_TENSOR_MTP_NORM,          "weight", i), {n_embd}, 0);
++                        }
+                     }
+                 } break;
+             case LLM_ARCH_LLAMA:
+diff --git a/src/llama-model.h b/src/llama-model.h
+index d60b0986e..1eda3db2b 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -506,6 +506,16 @@ struct llama_layer {
+     struct ggml_tensor * hc_ffn_fn     = nullptr;
+     struct ggml_tensor * hc_ffn_scale  = nullptr;
+ 
++    // MTP (Multi-Token Prediction) head -- DeepSeek V4
++    struct ggml_tensor * mtp_e_proj        = nullptr;
++    struct ggml_tensor * mtp_h_proj        = nullptr;
++    struct ggml_tensor * mtp_enorm         = nullptr;
++    struct ggml_tensor * mtp_hnorm         = nullptr;
++    struct ggml_tensor * mtp_hc_head_base  = nullptr;
++    struct ggml_tensor * mtp_hc_head_fn    = nullptr;
++    struct ggml_tensor * mtp_hc_head_scale = nullptr;
++    struct ggml_tensor * mtp_norm          = nullptr;
++
+     // gemma4 layer output scale
+     struct ggml_tensor * out_scale = nullptr;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 56af9707e..3971fcbc0 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1375,14 +1375,38 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
+         inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
+     }
+ 
+-    ggml_tensor * cur = dsv4_hc_head(ctx0, inpL,
+-            model.output_hc_fn, model.output_hc_scale, model.output_hc_base,
+-            n_embd, n_hc, inp_out_ids ? n_outputs : n_tokens,
+-            norm_rms_eps, hparams.hc_eps);
+-    cb(cur, "result_hc", -1);
+-
+-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+-    cb(cur, "result_norm", -1);
++    ggml_tensor * cur;
++    if (hparams.nextn_predict_layers > 0 && n_layer > 0) {
++        const auto & last_layer = model.layers[n_layer - 1];
++        if (last_layer.mtp_hc_head_fn && last_layer.mtp_hc_head_base &&
++            last_layer.mtp_hc_head_scale && last_layer.mtp_norm) {
++            cur = dsv4_hc_head(ctx0, inpL,
++                    last_layer.mtp_hc_head_fn,
++                    last_layer.mtp_hc_head_scale,
++                    last_layer.mtp_hc_head_base,
++                    n_embd, n_hc, inp_out_ids ? n_outputs : n_tokens,
++                    norm_rms_eps, hparams.hc_eps);
++            cb(cur, "result_hc_mtp", -1);
++            cur = build_norm(cur, last_layer.mtp_norm, nullptr, LLM_NORM_RMS, -1);
++            cb(cur, "result_norm_mtp", -1);
++        } else {
++            cur = dsv4_hc_head(ctx0, inpL,
++                    model.output_hc_fn, model.output_hc_scale, model.output_hc_base,
++                    n_embd, n_hc, inp_out_ids ? n_outputs : n_tokens,
++                    norm_rms_eps, hparams.hc_eps);
++            cb(cur, "result_hc", -1);
++            cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++            cb(cur, "result_norm", -1);
++        }
++    } else {
++        cur = dsv4_hc_head(ctx0, inpL,
++                model.output_hc_fn, model.output_hc_scale, model.output_hc_base,
++                n_embd, n_hc, inp_out_ids ? n_outputs : n_tokens,
++                norm_rms_eps, hparams.hc_eps);
++        cb(cur, "result_hc", -1);
++        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++        cb(cur, "result_norm", -1);
++    }
+     res->t_embd = cur;
+ 
+     cur = ggml_mul_mat(ctx0, model.output, cur);
