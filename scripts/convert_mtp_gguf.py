@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Convert ds4 MTP GGUF to standard deepseek4 GGUF for Fringe210 -md flag.
+"""Convert ds4 MTP GGUF to standalone deepseek4 draft GGUF for Fringe210 -md flag.
 
-Reads the MTP GGUF (mtp.0.* tensor names), writes a new GGUF with blk.0.* names
-and general.architecture = deepseek4.
+Reads the MTP GGUF (mtp.0.* tensors), merges missing weights from the main model
+(token_embd, output, output_norm), renames tensors to blk.0.*, sets arch=deepseek4.
 
 Usage:
-  python3 convert_mtp_gguf.py <input.mtp.gguf> [output.gguf]
+  python3 convert_mtp_gguf.py <mtp.gguf> --donor <main.gguf> [output.gguf]
 
-Requires the gguf-py package from the Fringe210 llama.cpp tree.
-Auto-detects ~/llama-dsv4-fringe/gguf-py or /tmp/fringe-analysis/gguf-py.
+Patches from Spark test session 2026-05-15:
+  P1: State machine ordering — add_tensor BEFORE write_header/kv/ti
+  P2: Removed redundant write_ti_data_to_file (write_tensors_to_file calls it)
+  P3: Use ReaderField.contents() for metadata extraction
+  P4: --donor flag merges token_embd/output/output_norm from main model
 """
 import sys, os, numpy as np
 from collections import OrderedDict
 from typing import Any
 
-# Auto-detect gguf-py from common Fringe210 locations
 for candidate in [
     os.path.expanduser("~/llama-dsv4-fringe/gguf-py"),
     "/tmp/fringe-analysis/gguf-py",
@@ -30,58 +32,54 @@ except ImportError:
     print("Error: gguf-py not found. Set PYTHONPATH to Fringe210/gguf-py")
     sys.exit(1)
 
-
-def extract_value(field) -> Any:
-    types = field.types
-    if not types:
-        return None
-    main_type = types[0]
-    if main_type == GGUFValueType.STRING:
-        return str(bytes(field.parts[field.data[0]]), encoding='utf-8')
-    if main_type == GGUFValueType.ARRAY:
-        if len(types) < 2:
-            return None
-        sub_type = types[1]
-        arr = field.parts[field.data[0]]
-        if sub_type == GGUFValueType.STRING:
-            return [str(bytes(s), encoding='utf-8') for s in arr]
-        return arr.tolist()
-    val = field.parts[field.data[0]]
-    if hasattr(val, '__iter__') and len(val) == 1:
-        return val[0].item() if hasattr(val[0], 'item') else val[0]
-    return val.item() if hasattr(val, 'item') else val
+DONOR_TENSORS = ["token_embd.weight", "output_norm.weight", "output.weight"]
 
 
-def remap_name(name: str) -> str:
-    if name.startswith("mtp.0."):
-        return "blk.0." + name[len("mtp.0."):]
-    return name
-
-
-def convert(input_path: str, output_path: str):
-    print(f"Reading: {input_path}")
+def convert(input_path: str, donor_path: str, output_path: str):
+    print(f"MTP GGUF:  {input_path}")
     reader = GGUFReader(input_path, 'r')
 
+    # ---- metadata ----
     metadata = OrderedDict()
     for key, field in reader.fields.items():
         if key.startswith("GGUF."):
             continue
         try:
-            val = extract_value(field)
-            metadata[key] = (val, field.types)
+            metadata[key] = (field.contents(), field.types)
         except Exception as e:
-            print(f"  WARNING: Could not extract key {key}: {e}")
+            print(f"  WARNING: key {key}: {e}")
+
+    # Force block_count to 1 (MTP is single-layer)
+    block_count_key = None
+    for key in metadata:
+        if key.endswith(".block_count"):
+            block_count_key = key
+            break
+    if block_count_key:
+        metadata[block_count_key] = (1, metadata[block_count_key][1])
+        print(f"Forced {block_count_key} = 1")
 
     arch = "deepseek4"
     print(f"Target arch: {arch}")
-    print(f"Tensors: {len(reader.tensors)}")
-    for t in reader.tensors[:5]:
-        print(f"  {t.name} shape={list(t.shape)} type={t.tensor_type.name} nbytes={t.n_bytes}")
-    if len(reader.tensors) > 5:
-        print(f"  ... and {len(reader.tensors) - 5} more")
+    print(f"MTP tensors: {len(reader.tensors)}")
 
+    # ---- open donor ----
+    donor = None
+    if donor_path and os.path.exists(donor_path):
+        print(f"Donor GGUF: {donor_path}")
+        donor = GGUFReader(donor_path, 'r')
+        donor_tensors = {t.name: t for t in donor.tensors}
+        for name in DONOR_TENSORS:
+            if name in donor_tensors:
+                t = donor_tensors[name]
+                print(f"  Found: {name}  {list(t.shape)}  {t.tensor_type.name}  {t.n_bytes} bytes")
+            else:
+                print(f"  WARNING: {name} not found in donor GGUF")
+
+    # ---- build writer ----
     writer = GGUFWriter(output_path, arch)
 
+    # Copy metadata (skip general.architecture, writer sets it)
     for key, (val, types) in metadata.items():
         if key == "general.architecture":
             continue
@@ -116,34 +114,65 @@ def convert(input_path: str, output_path: str):
             else:
                 print(f"  SKIP: {key} type={main_type}")
         except Exception as e:
-            print(f"  ERROR adding key {key}: {e}")
+            print(f"  ERROR: {key}: {e}")
 
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_ti_data_to_file()
+    # ---- add tensors (P1: BEFORE write_*_to_file) ----
+    print(f"\nAdding tensors...")
 
-    print(f"\nWriting tensors with remapped names...")
+    # First, donor tensors (token_embd, output_norm, output)
+    if donor:
+        donor_tensors = {t.name: t for t in donor.tensors}
+        for name in DONOR_TENSORS:
+            if name in donor_tensors:
+                t = donor_tensors[name]
+                writer.add_tensor(name, t.data, raw_dtype=t.tensor_type)
+                print(f"  [+donor] {name}  {list(t.shape)}  {t.n_bytes} bytes")
+
+    # Then, remapped MTP tensors
     for i, rt in enumerate(reader.tensors):
-        new_name = remap_name(rt.name)
+        new_name = rt.name
+        if rt.name.startswith("mtp.0."):
+            new_name = "blk.0." + rt.name[len("mtp.0."):]
         if new_name != rt.name:
             print(f"  [{i}] {rt.name} -> {new_name}")
         writer.add_tensor(new_name, rt.data, raw_dtype=rt.tensor_type)
 
+    # ---- write file (P1+P2: correct order, no redundant TI write) ----
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
+
     print(f"\nDone: {output_path}")
-    for key in metadata:
-        if any(kw in key for kw in ['block_count','head_count','layer_count','expert_count','n_hc']):
-            print(f"  {key}: {metadata[key][0]}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
-        print("Usage: python3 convert_mtp_gguf.py <input.mtp.gguf> [output.gguf]")
         sys.exit(1)
+
     inp = sys.argv[1]
-    out = sys.argv[2] if len(sys.argv) > 2 else "mtp-converted-deepseek4.gguf"
+    donor = None
+    out = "mtp-converted-deepseek4.gguf"
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--donor" and i + 1 < len(args):
+            donor = args[i + 1]
+            i += 2
+        elif not args[i].startswith("--"):
+            out = args[i]
+            i += 1
+        else:
+            i += 1
+
     if not os.path.exists(inp):
-        print(f"Error: {inp} not found")
+        print(f"Error: MTP GGUF not found: {inp}")
         sys.exit(1)
-    convert(inp, out)
+    if donor and not os.path.exists(donor):
+        print(f"Error: donor GGUF not found: {donor}")
+        sys.exit(1)
+    if not donor:
+        print("Warning: no --donor specified. token_embd/output weights will be missing.")
+        print("The draft model will fail to load without these.")
+
+    convert(inp, donor, out)
