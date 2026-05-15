@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Convert ds4 MTP GGUF to standalone deepseek4 draft GGUF for Fringe210 -md flag.
 
-Patches: P1-P9. Borrows indexer/compressor tensors from donor's last block.
+Patches: P1-P10. Drops 8 MTP-specific tensors (hc_head_*, e_proj, h_proj, enorm,
+hnorm, norm) that LLM_ARCH_DEEPSEEK4 has no slots for. The resulting draft is a
+1-block deepseek4 transformer using only trunk tensors.
 """
 import sys, os, re, numpy as np
 from collections import OrderedDict
@@ -21,7 +23,6 @@ try:
 except ImportError:
     print("Error: gguf-py not found"); sys.exit(1)
 
-# Global tensors always copied from donor
 DONOR_GLOBALS = [
     "token_embd.weight",
     "output_norm.weight",
@@ -30,6 +31,15 @@ DONOR_GLOBALS = [
     "output_hc_fn.weight",
     "output_hc_scale.weight",
 ]
+
+# P10: MTP-specific tensors that LLM_ARCH_DEEPSEEK4 has no slot for.
+# These implement the embedding/hidden mixing (e_proj, h_proj, enorm, hnorm)
+# and the MTP output head (hc_head_*, norm). Dropped for now.
+MTP_DROP_SUFFIXES = {
+    "hc_head_base.weight", "hc_head_fn.weight", "hc_head_scale.weight",
+    "e_proj.weight", "h_proj.weight",
+    "enorm.weight", "hnorm.weight", "norm.weight",
+}
 
 
 def read_metadata(reader, label):
@@ -91,16 +101,6 @@ def force_override(merged, suffix, new_val):
             return
 
 
-def find_last_block(tensors):
-    """Find the highest blk.N.* layer number in donor tensors."""
-    max_n = -1
-    for name in tensors:
-        m = re.match(r'blk\.(\d+)\.', name)
-        if m:
-            max_n = max(max_n, int(m.group(1)))
-    return max_n
-
-
 def convert(input_path: str, donor_path: str, output_path: str):
     print(f"MTP:  {input_path}")
     reader = GGUFReader(input_path, 'r')
@@ -122,10 +122,13 @@ def convert(input_path: str, donor_path: str, output_path: str):
     print(f"  Donor block_count: {donor_bc}")
 
     donor_tensors = {t.name: t for t in donor.tensors}
-    last_block = find_last_block(donor_tensors)
-    print(f"  Donor last block: blk.{last_block}")
+    for name in DONOR_GLOBALS:
+        if name in donor_tensors:
+            t = donor_tensors[name]
+            print(f"  Donor tensor: {name}  {list(t.shape)}  {t.n_bytes} bytes")
+        else:
+            print(f"  WARNING: {name} not in donor")
 
-    # P5: seed from donor, overlay MTP
     merged = OrderedDict(donor_meta)
     merged.update(mtp_meta)
     if donor_bc is not None:
@@ -133,53 +136,37 @@ def convert(input_path: str, donor_path: str, output_path: str):
     force_override(merged, ".block_count", 1)
     force_override(merged, ".hash_layer_count", 0)
 
-    # P9: find which blk.{last_block}.* tensors the MTP source is missing
-    mtp_tensor_names = {rt.name for rt in reader.tensors}
-    borrow = {}
-    blk_re = re.compile(r'^blk\.\d+\.(.+)$')
-    for name, t in donor_tensors.items():
-        m = blk_re.match(name)
-        if not m:
-            continue
-        suffix = m.group(1)
-        blk_n = int(name.split('.')[1])
-        if blk_n != last_block:
-            continue
-        mtp_name = f"mtp.0.{suffix}"
-        target_name = f"blk.0.{suffix}"
-        if mtp_name not in mtp_tensor_names and target_name not in mtp_tensor_names:
-            borrow[name] = (target_name, t)
-            print(f"  [P9 borrow] {name} -> {target_name}  {list(t.shape)}  {t.n_bytes} bytes")
-
     arch = "deepseek4"
     print(f"Target arch: {arch}")
     print(f"Merged keys: {len(merged)}")
-    print(f"MTP tensors: {len(reader.tensors)}, borrowed: {len(borrow)}")
 
     writer = GGUFWriter(output_path, arch)
     write_metadata(writer, merged)
 
+    # Count what we'll write
+    n_global = 0; n_mtp = 0; n_dropped = 0
+
     print(f"\nAdding tensors...")
-    # Global donor tensors
     for name in DONOR_GLOBALS:
         if name in donor_tensors:
             t = donor_tensors[name]
             writer.add_tensor(name, t.data, raw_dtype=t.tensor_type)
+            n_global += 1
             print(f"  [+donor] {name}")
 
-    # Borrowed per-block tensors from donor's last block
-    for orig_name, (target_name, t) in borrow.items():
-        writer.add_tensor(target_name, t.data, raw_dtype=t.tensor_type)
-        print(f"  [borrow] {target_name}")
-
-    # Remapped MTP tensors
     for i, rt in enumerate(reader.tensors):
-        new_name = rt.name
-        if rt.name.startswith("mtp.0."):
-            new_name = "blk.0." + rt.name[len("mtp.0."):]
+        suffix = rt.name[len("mtp.0."):] if rt.name.startswith("mtp.0.") else None
+        if suffix and suffix in MTP_DROP_SUFFIXES:
+            print(f"  [DROP] {rt.name}  (no arch slot)")
+            n_dropped += 1
+            continue
+        new_name = "blk.0." + suffix if suffix else rt.name
         if new_name != rt.name:
             print(f"  [{i}] {rt.name} -> {new_name}")
         writer.add_tensor(new_name, rt.data, raw_dtype=rt.tensor_type)
+        n_mtp += 1
+
+    print(f"\nTally: {n_global} donor + {n_mtp} MTP = {n_global + n_mtp} total ({n_dropped} dropped)")
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
