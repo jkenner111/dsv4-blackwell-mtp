@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Convert ds4 MTP GGUF to standalone deepseek4 draft GGUF for Fringe210 -md flag.
 
-Patches: P1-P10. Drops 8 MTP-specific tensors (hc_head_*, e_proj, h_proj, enorm,
-hnorm, norm) that LLM_ARCH_DEEPSEEK4 has no slots for. The resulting draft is a
-1-block deepseek4 transformer using only trunk tensors.
+Patches P1-P11. All 32 MTP tensors pass through (C++ arch now has slots for all 8
+previously-dropped tensors). Expected output: 6 donor + 32 MTP = 38 tensors.
 """
-import sys, os, re, numpy as np
+import sys, os, numpy as np
 from collections import OrderedDict
 from typing import Any
 
@@ -31,15 +30,6 @@ DONOR_GLOBALS = [
     "output_hc_fn.weight",
     "output_hc_scale.weight",
 ]
-
-# P10: MTP-specific tensors that LLM_ARCH_DEEPSEEK4 has no slot for.
-# These implement the embedding/hidden mixing (e_proj, h_proj, enorm, hnorm)
-# and the MTP output head (hc_head_*, norm). Dropped for now.
-MTP_DROP_SUFFIXES = {
-    "hc_head_base.weight", "hc_head_fn.weight", "hc_head_scale.weight",
-    "e_proj.weight", "h_proj.weight",
-    "enorm.weight", "hnorm.weight", "norm.weight",
-}
 
 
 def read_metadata(reader, label):
@@ -143,8 +133,7 @@ def convert(input_path: str, donor_path: str, output_path: str):
     writer = GGUFWriter(output_path, arch)
     write_metadata(writer, merged)
 
-    # Count what we'll write
-    n_global = 0; n_mtp = 0; n_dropped = 0
+    n_global = 0; n_mtp = 0
 
     print(f"\nAdding tensors...")
     for name in DONOR_GLOBALS:
@@ -154,19 +143,17 @@ def convert(input_path: str, donor_path: str, output_path: str):
             n_global += 1
             print(f"  [+donor] {name}")
 
+    # P11: all 32 MTP tensors pass through (C++ arch now has slots)
     for i, rt in enumerate(reader.tensors):
-        suffix = rt.name[len("mtp.0."):] if rt.name.startswith("mtp.0.") else None
-        if suffix and suffix in MTP_DROP_SUFFIXES:
-            print(f"  [DROP] {rt.name}  (no arch slot)")
-            n_dropped += 1
-            continue
-        new_name = "blk.0." + suffix if suffix else rt.name
+        new_name = rt.name
+        if rt.name.startswith("mtp.0."):
+            new_name = "blk.0." + rt.name[len("mtp.0."):]
         if new_name != rt.name:
             print(f"  [{i}] {rt.name} -> {new_name}")
         writer.add_tensor(new_name, rt.data, raw_dtype=rt.tensor_type)
         n_mtp += 1
 
-    print(f"\nTally: {n_global} donor + {n_mtp} MTP = {n_global + n_mtp} total ({n_dropped} dropped)")
+    print(f"\nTally: {n_global} donor + {n_mtp} MTP = {n_global + n_mtp} total")
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
