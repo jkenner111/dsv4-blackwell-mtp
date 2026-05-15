@@ -8,15 +8,12 @@ Usage:
   python3 convert_mtp_gguf.py <mtp.gguf> --donor <main.gguf> [output.gguf]
 
 Patches:
-  P1: add_tensor BEFORE write_header (state machine ordering)
-  P2: removed redundant write_ti_data_to_file
-  P3: use field.contents() for metadata extraction
-  P4: --donor merges token_embd/output/output_norm tensors
-  P5: seed metadata from donor, overlay MTP keys, block_count=1
+  P1-P5: state ordering, redundant TI, field.contents(), donor merge, metadata seed
+  P6: slice per-layer donor arrays to length 1 to match block_count=1
 """
 import sys, os, numpy as np
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Sequence
 
 for candidate in [
     os.path.expanduser("~/llama-dsv4-fringe/gguf-py"),
@@ -37,7 +34,6 @@ DONOR_TENSORS = ["token_embd.weight", "output_norm.weight", "output.weight"]
 
 
 def read_metadata(reader, label):
-    """Extract all metadata KV pairs from a GGUFReader."""
     md = OrderedDict()
     for key, field in reader.fields.items():
         if key.startswith("GGUF."):
@@ -50,7 +46,6 @@ def read_metadata(reader, label):
 
 
 def write_metadata(writer, metadata):
-    """Write metadata KV pairs to a GGUFWriter."""
     for key, (val, types) in metadata.items():
         if key == "general.architecture":
             continue
@@ -88,21 +83,45 @@ def write_metadata(writer, metadata):
             print(f"  ERROR: {key}: {e}")
 
 
+def slice_arrays(metadata, donor_block_count: int):
+    """P6: Slice per-layer arrays to length 1 to match block_count=1."""
+    candidates = {donor_block_count, donor_block_count + 1}
+    for key, (val, types) in list(metadata.items()):
+        if types[0] != GGUFValueType.ARRAY:
+            continue
+        if not isinstance(val, (list, np.ndarray)):
+            continue
+        arr_len = len(val)
+        if arr_len in candidates:
+            last = val[-1]
+            if hasattr(last, 'item'):
+                last = last.item()
+            metadata[key] = ([last], types)
+            print(f"  sliced {key}: {arr_len} -> 1 (kept last: {last})")
+
+
 def convert(input_path: str, donor_path: str, output_path: str):
     print(f"MTP GGUF:  {input_path}")
     reader = GGUFReader(input_path, 'r')
     mtp_meta = read_metadata(reader, "mtp")
     print(f"  MTP metadata keys: {len(mtp_meta)}")
 
-    # Open donor and read its metadata + tensors
     if not donor_path or not os.path.exists(donor_path):
-        print("Error: --donor is required (provides model hyperparameters + weights)")
+        print("Error: --donor is required")
         sys.exit(1)
 
     print(f"Donor GGUF: {donor_path}")
     donor = GGUFReader(donor_path, 'r')
     donor_meta = read_metadata(donor, "donor")
     print(f"  Donor metadata keys: {len(donor_meta)}")
+
+    # Find donor block_count for P6 slicing
+    donor_bc = None
+    for key in donor_meta:
+        if key.endswith(".block_count"):
+            donor_bc = int(donor_meta[key][0])
+            break
+    print(f"  Donor block_count: {donor_bc}")
 
     donor_tensors = {t.name: t for t in donor.tensors}
     for name in DONOR_TENSORS:
@@ -112,11 +131,15 @@ def convert(input_path: str, donor_path: str, output_path: str):
         else:
             print(f"  WARNING: {name} not in donor")
 
-    # ---- P5: seed metadata from donor, overlay MTP keys ----
-    merged = OrderedDict(donor_meta)        # donor provides all hyperparams
-    merged.update(mtp_meta)                 # MTP overrides (nextn_predict_layers, mtp_layer_count, etc.)
+    # P5: seed metadata from donor, overlay MTP
+    merged = OrderedDict(donor_meta)
+    merged.update(mtp_meta)
 
-    # P5: force block_count to 1 (single-layer MTP)
+    # P6: slice per-layer arrays
+    if donor_bc is not None:
+        slice_arrays(merged, donor_bc)
+
+    # Force block_count to 1
     for key in merged:
         if key.endswith(".block_count"):
             merged[key] = (1, merged[key][1])
@@ -128,21 +151,16 @@ def convert(input_path: str, donor_path: str, output_path: str):
     print(f"Merged metadata keys: {len(merged)}")
     print(f"MTP tensors: {len(reader.tensors)}")
 
-    # ---- build writer ----
     writer = GGUFWriter(output_path, arch)
     write_metadata(writer, merged)
 
-    # ---- P1: add tensors BEFORE write_*_to_file ----
     print(f"\nAdding tensors...")
-
-    # Donor tensors first
     for name in DONOR_TENSORS:
         if name in donor_tensors:
             t = donor_tensors[name]
             writer.add_tensor(name, t.data, raw_dtype=t.tensor_type)
             print(f"  [+donor] {name}")
 
-    # Remapped MTP tensors
     for i, rt in enumerate(reader.tensors):
         new_name = rt.name
         if rt.name.startswith("mtp.0."):
@@ -151,7 +169,6 @@ def convert(input_path: str, donor_path: str, output_path: str):
             print(f"  [{i}] {rt.name} -> {new_name}")
         writer.add_tensor(new_name, rt.data, raw_dtype=rt.tensor_type)
 
-    # ---- P1+P2: write ----
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
